@@ -2,36 +2,41 @@ package mods
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
-// ListInstalled 扫描 mods 根目录并返回全部有效 mod 条目。
+// ListInstalled 扫描 mods 根目录（含任意层级子文件夹）并返回全部有效 mod 条目。
 func ListInstalled(modsRoot string) (*ModsOverview, error) {
+	modsRoot = filepath.Clean(modsRoot)
 	out := &ModsOverview{ModsDir: modsRoot, Mods: []InstalledMod{}, DuplicateIDs: []string{}}
-	entries, err := os.ReadDir(modsRoot)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return out, nil
-		}
-		return nil, err
-	}
 	idToLocs := map[string][]modInstanceKey{}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+
+	err := filepath.WalkDir(modsRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		folderName := e.Name()
-		if strings.HasPrefix(folderName, ".") {
-			continue
+		if !d.IsDir() {
+			return nil
 		}
-		dir := filepath.Join(modsRoot, folderName)
-		discovered, err := findAllManifestsInFolder(dir)
+		if path == modsRoot {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		discovered, err := findAllManifestsInFolder(path)
 		if err != nil || len(discovered) == 0 {
-			continue
+			return nil
 		}
+		rel, err := filepath.Rel(modsRoot, path)
+		if err != nil {
+			return nil
+		}
+		folderName := filepath.ToSlash(rel)
 		for _, me := range discovered {
 			id := me.Man.ID
 			idToLocs[id] = append(idToLocs[id], modInstanceKey{folderName, me.FileName})
@@ -42,6 +47,13 @@ func ListInstalled(modsRoot string) (*ModsOverview, error) {
 				Manifest:     me.Man,
 			})
 		}
+		return nil
+	})
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return nil, err
 	}
 	for id, locs := range idToLocs {
 		if len(locs) > 1 {

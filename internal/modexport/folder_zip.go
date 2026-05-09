@@ -12,13 +12,21 @@ import (
 )
 
 // ResolvedSubfolder 返回 mods 根目录下子文件夹的绝对路径，并防止目录穿越。
+// folderName 可为多级相对路径（如 dir1/dir2），使用正斜杠或系统分隔符均可。
 func ResolvedSubfolder(modsRoot, folderName string) (string, error) {
 	modsRoot = filepath.Clean(modsRoot)
 	folderName = strings.TrimSpace(folderName)
 	if folderName == "" {
 		return "", fmt.Errorf("文件夹名为空")
 	}
-	folder := filepath.Join(modsRoot, folderName)
+	rel := filepath.Clean(filepath.FromSlash(folderName))
+	if rel == "." || rel == ".." {
+		return "", fmt.Errorf("无效的 mod 路径")
+	}
+	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("无效的 mod 路径")
+	}
+	folder := filepath.Join(modsRoot, rel)
 	folder = filepath.Clean(folder)
 	if folder == modsRoot || !strings.HasPrefix(folder+string(os.PathSeparator), modsRoot+string(os.PathSeparator)) {
 		return "", fmt.Errorf("无效的 mod 路径")

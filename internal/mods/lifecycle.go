@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"ModManager/internal/modexport"
 )
 
 func renameIfExists(from, to string) error {
@@ -21,11 +23,9 @@ func renameIfExists(from, to string) error {
 
 // DeleteEntry 删除一条 mod：manifest 及对应 {id}.pck / .dll（含 .bak）；不删整个文件夹。
 func DeleteEntry(modsRoot, folderName, manifestFile string) error {
-	folder := filepath.Join(modsRoot, folderName)
-	folder = filepath.Clean(folder)
-	root := filepath.Clean(modsRoot)
-	if folder == root || !strings.HasPrefix(folder+string(os.PathSeparator), root+string(os.PathSeparator)) {
-		return errors.New("非法路径")
+	folder, err := modexport.ResolvedSubfolder(modsRoot, folderName)
+	if err != nil {
+		return err
 	}
 	mp := filepath.Join(folder, manifestFile)
 	b, err := os.ReadFile(mp)
@@ -49,7 +49,10 @@ func DeleteEntry(modsRoot, folderName, manifestFile string) error {
 
 // Disable 关闭 mod：将 manifest 与对应 pck/dll 加 .bak。
 func Disable(modsRoot, folderName, manifestFile string) error {
-	folder := filepath.Join(modsRoot, folderName)
+	folder, err := modexport.ResolvedSubfolder(modsRoot, folderName)
+	if err != nil {
+		return err
+	}
 	jsonPath := filepath.Join(folder, manifestFile)
 	if strings.HasSuffix(strings.ToLower(manifestFile), ".json.bak") {
 		return errors.New("该 mod 已处于关闭状态")
@@ -77,7 +80,10 @@ func Enable(modsRoot, folderName, manifestBakFile string) error {
 	if !strings.HasSuffix(strings.ToLower(manifestBakFile), ".json.bak") {
 		return errors.New("请指定关闭状态的 manifest 文件（*.json.bak）")
 	}
-	folder := filepath.Join(modsRoot, folderName)
+	folder, err := modexport.ResolvedSubfolder(modsRoot, folderName)
+	if err != nil {
+		return err
+	}
 	oldPath := filepath.Join(folder, manifestBakFile)
 	b, err := os.ReadFile(oldPath)
 	if err != nil {

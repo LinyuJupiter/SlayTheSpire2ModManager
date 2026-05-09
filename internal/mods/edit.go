@@ -7,18 +7,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"ModManager/internal/modexport"
 )
 
-func validateFolderBasename(name string) error {
+func normalizeFolderKey(s string) string {
+	return filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(s))))
+}
+
+func validateRelFolderPath(name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("文件夹名不能为空")
 	}
-	if name != filepath.Base(name) {
-		return errors.New("文件夹名不能包含路径分隔符")
-	}
-	if strings.Contains(name, "..") {
+	rel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(name)))
+	if rel == "." || rel == ".." {
 		return errors.New("文件夹名无效")
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return errors.New("文件夹名无效")
+		}
+		if strings.HasPrefix(seg, ".") {
+			return errors.New("文件夹名不能包含以 . 开头的路径段")
+		}
 	}
 	return nil
 }
@@ -29,11 +41,14 @@ func SaveEdits(modsRoot string, payload ModEditPayload) error {
 	if newFolder == "" {
 		newFolder = payload.FolderName
 	}
-	if err := validateFolderBasename(newFolder); err != nil {
+	if err := validateRelFolderPath(newFolder); err != nil {
 		return err
 	}
 
-	oldFolderPath := filepath.Join(modsRoot, payload.FolderName)
+	oldFolderPath, err := modexport.ResolvedSubfolder(modsRoot, payload.FolderName)
+	if err != nil {
+		return err
+	}
 	jsonPath := filepath.Join(oldFolderPath, payload.ManifestFile)
 	old, err := loadManifestFromPath(jsonPath)
 	if err != nil {
@@ -68,8 +83,11 @@ func SaveEdits(modsRoot string, payload ModEditPayload) error {
 	}
 
 	workingFolder := oldFolderPath
-	if newFolder != payload.FolderName {
-		destFolder := filepath.Join(modsRoot, newFolder)
+	if normalizeFolderKey(newFolder) != normalizeFolderKey(payload.FolderName) {
+		destFolder, err := modexport.ResolvedSubfolder(modsRoot, newFolder)
+		if err != nil {
+			return err
+		}
 		if _, err := os.Stat(destFolder); err == nil {
 			return errors.New("目标文件夹已存在: " + newFolder)
 		}

@@ -8,15 +8,19 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ModManager/internal/config"
-	"ModManager/internal/importer"
-	"ModManager/internal/modexport"
 	"ModManager/internal/mods"
-	"ModManager/internal/shell"
-	"ModManager/internal/steam"
+	"ModManager/internal/platform/config"
+	"ModManager/internal/platform/modarchive"
+	"ModManager/internal/platform/shell"
+	"ModManager/internal/platform/steam"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+// tryAutoNormalizeMods 在启动、保存路径、导入后整理 mods 目录；失败不阻断主流程。
+func tryAutoNormalizeMods(modsRoot string) {
+	_, _ = mods.NormalizeLayout(modsRoot)
+}
 
 // App Wails 绑定入口。
 type App struct {
@@ -40,6 +44,7 @@ func (a *App) Startup(ctx context.Context) {
 		modsRoot, err := mods.EnsureDirectory(a.cfg.GameExePath)
 		if err == nil {
 			_ = mods.EnsureHeyboxSupport(modsRoot, a.heyboxZip)
+			tryAutoNormalizeMods(modsRoot)
 		}
 	}
 }
@@ -100,7 +105,11 @@ func (a *App) SetGameExe(path string) error {
 	if err != nil {
 		return err
 	}
-	return mods.EnsureHeyboxSupport(modsRoot, a.heyboxZip)
+	if err := mods.EnsureHeyboxSupport(modsRoot, a.heyboxZip); err != nil {
+		return err
+	}
+	tryAutoNormalizeMods(modsRoot)
+	return nil
 }
 
 // PickGameExe 打开文件对话框选择游戏主程序。
@@ -136,6 +145,7 @@ func (a *App) ListMods() (*mods.ModsOverview, error) {
 		return nil, fmt.Errorf("请先设置游戏路径")
 	}
 	modsRoot := filepath.Join(filepath.Dir(a.cfg.GameExePath), "mods")
+	tryAutoNormalizeMods(modsRoot)
 	return mods.ListInstalled(modsRoot)
 }
 
@@ -148,8 +158,8 @@ func (a *App) SaveModEdit(payload mods.ModEditPayload) error {
 	return mods.SaveEdits(modsRoot, payload)
 }
 
-// ImportModArchive 从 zip/rar 导入 mod 到 mods 目录。
-func (a *App) ImportModArchive(archivePath string, folderName string) error {
+// ImportModArchive 从 zip/rar 导入 mod 到 mods 目录（按 manifest id 合并目录，不指定文件夹名）。
+func (a *App) ImportModArchive(archivePath string) error {
 	if strings.TrimSpace(a.cfg.GameExePath) == "" {
 		return fmt.Errorf("请先设置游戏路径")
 	}
@@ -157,16 +167,43 @@ func (a *App) ImportModArchive(archivePath string, folderName string) error {
 	if err := os.MkdirAll(modsRoot, 0o755); err != nil {
 		return err
 	}
-	return importer.ImportArchive(archivePath, modsRoot, strings.TrimSpace(folderName))
+	tmp, cleanup, err := modarchive.ExtractArchiveToTemp(archivePath)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if err := mods.InstallFromExtractedTree(tmp, modsRoot); err != nil {
+		return err
+	}
+	tryAutoNormalizeMods(modsRoot)
+	return nil
 }
 
-// DeleteModEntry 删除当前 manifest 对应的 mod 文件（不含同目录下其它 mod）。
-func (a *App) DeleteModEntry(folderName string, manifestFile string) error {
+// DeleteModEntry 删除 mod：deleteEntireSlug 为 true 时删除整个 slug 目录；否则删除 manifest 所在版本目录（整文件夹）。
+func (a *App) DeleteModEntry(folderName string, manifestFile string, deleteEntireSlug bool) error {
 	if strings.TrimSpace(a.cfg.GameExePath) == "" {
 		return fmt.Errorf("请先设置游戏路径")
 	}
 	modsRoot := filepath.Join(filepath.Dir(a.cfg.GameExePath), "mods")
-	return mods.DeleteEntry(modsRoot, strings.TrimSpace(folderName), strings.TrimSpace(manifestFile))
+	return mods.DeleteMod(modsRoot, strings.TrimSpace(folderName), strings.TrimSpace(manifestFile), deleteEntireSlug)
+}
+
+// NormalizeModsLayout 将 mods 整理为「slug/版本目录」结构；同目录多 mod 时无主文件复制到各拆分目录。
+func (a *App) NormalizeModsLayout() (*mods.NormalizeReport, error) {
+	if strings.TrimSpace(a.cfg.GameExePath) == "" {
+		return nil, fmt.Errorf("请先设置游戏路径")
+	}
+	modsRoot := filepath.Join(filepath.Dir(a.cfg.GameExePath), "mods")
+	return mods.NormalizeLayout(modsRoot)
+}
+
+// ActivateModVersion 将指定 manifest 作为该 id 的唯一启用版本（先关闭其它路径上同 id 的启用实例）。
+func (a *App) ActivateModVersion(folderName string, manifestFile string) error {
+	if strings.TrimSpace(a.cfg.GameExePath) == "" {
+		return fmt.Errorf("请先设置游戏路径")
+	}
+	modsRoot := filepath.Join(filepath.Dir(a.cfg.GameExePath), "mods")
+	return mods.ActivateModVersion(modsRoot, strings.TrimSpace(folderName), strings.TrimSpace(manifestFile))
 }
 
 // OpenModsFolder 在资源管理器中打开游戏 mods 目录（若不存在会先创建）。
@@ -187,7 +224,7 @@ func (a *App) OpenModFolder(folderName string) error {
 		return fmt.Errorf("请先设置游戏路径")
 	}
 	modsRoot := filepath.Join(filepath.Dir(a.cfg.GameExePath), "mods")
-	folderPath, err := modexport.ResolvedSubfolder(modsRoot, folderName)
+	folderPath, err := mods.ResolveSubfolder(modsRoot, folderName)
 	if err != nil {
 		return err
 	}
@@ -210,7 +247,7 @@ func (a *App) ExportModFolderZip(folderName string) error {
 		return fmt.Errorf("请先设置游戏路径")
 	}
 	modsRoot := filepath.Join(filepath.Dir(a.cfg.GameExePath), "mods")
-	folderPath, err := modexport.ResolvedSubfolder(modsRoot, folderName)
+	folderPath, err := mods.ResolveSubfolder(modsRoot, folderName)
 	if err != nil {
 		return err
 	}
@@ -242,7 +279,7 @@ func (a *App) ExportModFolderZip(folderName string) error {
 	if strings.ToLower(filepath.Ext(dest)) != ".zip" {
 		dest += ".zip"
 	}
-	return modexport.ZipDirectory(folderPath, dest)
+	return modarchive.ZipDirectory(folderPath, dest)
 }
 
 // DisableMod 关闭 mod。
@@ -260,5 +297,5 @@ func (a *App) EnableMod(folderName string, manifestBakFile string) error {
 		return fmt.Errorf("请先设置游戏路径")
 	}
 	modsRoot := filepath.Join(filepath.Dir(a.cfg.GameExePath), "mods")
-	return mods.Enable(modsRoot, strings.TrimSpace(folderName), strings.TrimSpace(manifestBakFile))
+	return mods.ActivateModVersion(modsRoot, strings.TrimSpace(folderName), strings.TrimSpace(manifestBakFile))
 }

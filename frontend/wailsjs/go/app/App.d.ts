@@ -3,7 +3,9 @@
 import {app} from '../models';
 import {mods} from '../models';
 
-export function DeleteModEntry(arg1:string,arg2:string):Promise<void>;
+export function ActivateModVersion(arg1:string,arg2:string):Promise<void>;
+
+export function DeleteModEntry(arg1:string,arg2:string,arg3:boolean):Promise<void>;
 
 export function DetectSteamGameExe():Promise<string>;
 
@@ -15,9 +17,11 @@ export function ExportModFolderZip(arg1:string):Promise<void>;
 
 export function GetUIState():Promise<app.UIState>;
 
-export function ImportModArchive(arg1:string,arg2:string):Promise<void>;
+export function ImportModArchive(arg1:string):Promise<void>;
 
 export function ListMods():Promise<mods.ModsOverview>;
+
+export function NormalizeModsLayout():Promise<mods.NormalizeReport>;
 
 export function OpenModFolder(arg1:string):Promise<void>;
 

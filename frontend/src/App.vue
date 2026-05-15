@@ -11,10 +11,10 @@ import {
   ImportModArchive,
   DeleteModEntry,
   DisableMod,
-  EnableMod,
   OpenModsFolder,
   OpenModFolder,
   ExportModFolderZip,
+  ActivateModVersion,
 } from '../wailsjs/go/app/App'
 const gameExePath = ref('')
 const modsRoot = ref('')
@@ -25,8 +25,9 @@ const actionError = ref('')
 const importError = ref('')
 const saving = ref(false)
 const importPath = ref('')
-const importFolderName = ref('')
 const editing = ref(null)
+/** 删除确认：null 关闭；含 folderName / manifestFile / modName */
+const deleteConfirm = ref(null)
 const detail = ref(null)
 /** 长 description 展开状态 key = folderName + manifestFile */
 const descExpanded = reactive({})
@@ -36,29 +37,158 @@ const duplicateBanner = computed(() => {
   return `以下 mod id 重复出现：${overview.value.duplicateIDs.join('、')}（请手动调整相关 JSON 中的 id）`
 })
 
-/** 列表按文件夹名聚合：连续相同 folderName 合并第一列，并带 rowspan */
-const rowsWithFolderSpan = computed(() => {
+/** 已规范布局：按 slug（第一段路径）聚合；否则仍按完整 folderName 聚合 */
+function folderGroupKey(m) {
+  if (m.layoutNormalized && m.folderName) {
+    const parts = String(m.folderName).replace(/\\/g, '/').split('/')
+    return parts[0] || m.folderName
+  }
+  return m.folderName
+}
+
+/** 文件夹列展示名：已规范时只显示 slug */
+function displayFolderLabel(m) {
+  if (m.layoutNormalized && m.folderName) {
+    const parts = String(m.folderName).replace(/\\/g, '/').split('/')
+    return parts[0] || m.folderName
+  }
+  return m.folderName
+}
+
+/** 打开/导出 使用的 mods 子路径（已规范时用 slug 目录） */
+function openFolderTargetPath(m) {
+  return displayFolderLabel(m)
+}
+
+function tryParseUintPrefix(s) {
+  s = String(s || '').trim()
+  let j = 0
+  while (j < s.length && s[j] >= '0' && s[j] <= '9') j++
+  if (j === 0) return { ok: false, val: 0 }
+  const val = parseInt(s.slice(0, j), 10)
+  return { ok: true, val: Number.isFinite(val) ? val : 0 }
+}
+
+/** 与后端 CompareModVersionStrings 一致：段内数值前缀优先，再字典序 */
+function compareModVersionStrings(a, b) {
+  a = String(a || '')
+    .trim()
+    .replace(/^v/i, '')
+  b = String(b || '')
+    .trim()
+    .replace(/^v/i, '')
+  if (a === b) return 0
+  const partsA = a.split('.')
+  const partsB = b.split('.')
+  const n = Math.max(partsA.length, partsB.length)
+  for (let i = 0; i < n; i++) {
+    const sa = partsA[i] ?? ''
+    const sb = partsB[i] ?? ''
+    const ia = tryParseUintPrefix(sa)
+    const ib = tryParseUintPrefix(sb)
+    if (ia.ok && ib.ok) {
+      if (ia.val !== ib.val) return ia.val > ib.val ? 1 : -1
+      continue
+    }
+    if (sa < sb) return -1
+    if (sa > sb) return 1
+  }
+  if (a < b) return -1
+  if (a > b) return 1
+  return 0
+}
+
+function pickRepresentativeMod(group) {
+  const on = group.find((x) => !x.disabled)
+  if (on) return on
+  const sorted = [...group].sort((a, b) =>
+    compareModVersionStrings(b.manifest?.version, a.manifest?.version)
+  )
+  return sorted[0] || group[0]
+}
+
+/** 已规范：同一 slug 多版本合并为一行，仅展示当前启用版本的信息；未规范仍一行一个目录 */
+const collapsedTableRows = computed(() => {
   const mods = overview.value?.mods ?? []
   const out = []
   let i = 0
   while (i < mods.length) {
-    const fn = mods[i].folderName
+    const m = mods[i]
+    if (!m.layoutNormalized) {
+      out.push({ mod: m, groupMods: [m], normalizedGroup: false })
+      i++
+      continue
+    }
+    const key = folderGroupKey(m)
     let j = i + 1
-    while (j < mods.length && mods[j].folderName === fn) {
+    while (j < mods.length && folderGroupKey(mods[j]) === key) {
       j++
     }
-    const span = j - i
-    for (let k = i; k < j; k++) {
-      out.push({
-        mod: mods[k],
-        folderFirst: k === i,
-        folderSpan: span,
-      })
-    }
+    const group = mods.slice(i, j)
+    out.push({
+      mod: pickRepresentativeMod(group),
+      groupMods: group,
+      normalizedGroup: true,
+    })
     i = j
   }
   return out
 })
+
+function collapsedRowKey(item) {
+  return item.normalizedGroup ? folderGroupKey(item.mod) : rowKey(item.mod)
+}
+
+function versionOptionsForGroup(anchorMod) {
+  const mods = overview.value?.mods ?? []
+  const key = folderGroupKey(anchorMod)
+  const g = mods.filter((x) => folderGroupKey(x) === key)
+  g.sort((a, b) => {
+    const c = compareModVersionStrings(a.manifest?.version, b.manifest?.version)
+    if (c !== 0) return -c
+    return rowKey(a).localeCompare(rowKey(b))
+  })
+  return g.map((mod) => ({
+    k: rowKey(mod),
+    label: mod.manifest?.version || versionFolderFallback(mod.folderName),
+    folderName: mod.folderName,
+    manifestFile: mod.manifestFile,
+    disabled: mod.disabled,
+  }))
+}
+
+function versionFolderFallback(folderName) {
+  const p = String(folderName).replace(/\\/g, '/').split('/')
+  return p.length >= 2 ? p[p.length - 1] : folderName
+}
+
+function selectedVersionKeyForGroup(anchorMod) {
+  const opts = versionOptionsForGroup(anchorMod)
+  const on = opts.find((o) => !o.disabled)
+  return (on || opts[0])?.k ?? ''
+}
+
+async function onVersionSelectFromGroup(ev, anchorMod) {
+  const sel = ev.target.value
+  if (!sel || saving.value) return
+  const cur = selectedVersionKeyForGroup(anchorMod)
+  if (sel === cur) return
+  const z = sel.indexOf('\u0000')
+  if (z < 0) return
+  const folderName = sel.slice(0, z)
+  const manifestFile = sel.slice(z + 1)
+  actionError.value = ''
+  saving.value = true
+  try {
+    await ActivateModVersion(folderName, manifestFile)
+    await refreshMods()
+  } catch (e) {
+    actionError.value = String(e)
+    ev.target.value = cur
+  } finally {
+    saving.value = false
+  }
+}
 
 function manifestJSON(m) {
   if (!m?.manifest) return ''
@@ -117,7 +247,7 @@ async function onToggleMod(row) {
   saving.value = true
   try {
     if (row.disabled) {
-      await EnableMod(row.folderName, row.manifestFile)
+      await ActivateModVersion(row.folderName, row.manifestFile)
     } else {
       await DisableMod(row.folderName, row.manifestFile)
     }
@@ -227,12 +357,27 @@ function closeDetail() {
   detail.value = null
 }
 
+function folderOuterForEdit(m) {
+  if (m.layoutNormalized && m.folderName) {
+    const parts = String(m.folderName).replace(/\\/g, '/').split('/')
+    return parts[0] || m.folderName
+  }
+  return m.folderName
+}
+
+function innerSegmentForFolder(folderName, layoutNormalized) {
+  if (!layoutNormalized || !folderName) return ''
+  const p = String(folderName).replace(/\\/g, '/').split('/')
+  return p.length >= 2 ? p.slice(1).join('/') : ''
+}
+
 function openEdit(row) {
   actionError.value = ''
   editing.value = {
     folderName: row.folderName,
-    newFolderName: row.folderName,
+    newFolderName: folderOuterForEdit(row),
     manifestFile: row.manifestFile,
+    layoutNormalized: !!row.layoutNormalized,
     id: row.manifest.id,
     name: row.manifest.name,
     description: row.manifest.description,
@@ -249,10 +394,14 @@ async function submitEdit() {
   actionError.value = ''
   saving.value = true
   try {
+    const inner = innerSegmentForFolder(editing.value.folderName, editing.value.layoutNormalized)
+    const newOuter = editing.value.newFolderName.trim()
+    const newFull = inner ? `${newOuter}/${inner}` : newOuter
     await SaveModEdit({
       folderName: editing.value.folderName,
       manifestFile: editing.value.manifestFile,
-      newFolderName: editing.value.newFolderName.trim(),
+      newFolderName: newFull,
+      layoutNormalized: editing.value.layoutNormalized,
       id: editing.value.id,
       name: editing.value.name,
       description: editing.value.description,
@@ -267,20 +416,31 @@ async function submitEdit() {
   }
 }
 
-async function deleteModFromEdit() {
+function openDeleteConfirmFromEdit() {
   if (!editing.value) return
-  const ok = confirm(
-    `确定删除此 Mod？\n将删除 manifest「${editing.value.manifestFile}」及对应的 {id}.pck / .dll（含 .bak）。\n同目录下的其它 mod 不会被删除。`
-  )
-  if (!ok) return
+  deleteConfirm.value = {
+    folderName: editing.value.folderName,
+    manifestFile: editing.value.manifestFile,
+    modName: (editing.value.name || '').trim() || editing.value.id,
+  }
+}
+
+function closeDeleteConfirm() {
+  deleteConfirm.value = null
+}
+
+async function runDelete(deleteEntireSlug) {
+  if (!deleteConfirm.value || saving.value) return
+  const { folderName, manifestFile } = deleteConfirm.value
   actionError.value = ''
   saving.value = true
   try {
-    await DeleteModEntry(editing.value.folderName, editing.value.manifestFile)
-    const fn = editing.value.folderName
-    const mf = editing.value.manifestFile
+    await DeleteModEntry(folderName, manifestFile, deleteEntireSlug)
+    closeDeleteConfirm()
     closeEdit()
-    if (detail.value?.folderName === fn && detail.value?.manifestFile === mf) closeDetail()
+    if (detail.value?.folderName === folderName && detail.value?.manifestFile === manifestFile) {
+      closeDetail()
+    }
     await refreshMods()
   } catch (e) {
     actionError.value = String(e)
@@ -307,9 +467,8 @@ async function doImport() {
   }
   saving.value = true
   try {
-    await ImportModArchive(importPath.value.trim(), importFolderName.value.trim())
+    await ImportModArchive(importPath.value.trim())
     importPath.value = ''
-    importFolderName.value = ''
     await refreshMods()
   } catch (e) {
     importError.value = String(e)
@@ -324,8 +483,13 @@ onMounted(refreshState)
 <template>
   <div class="layout">
     <header class="header">
-      <h1>杀戮尖塔 2 Mod 管理器</h1>
-      <p class="muted">配置游戏路径后，将扫描游戏目录下的 <code>mods</code> 文件夹并列出符合格式的 mod。</p>
+      <div class="header-brand">
+        <h1>杀戮尖塔 2 Mod 管理器</h1>
+        <span class="header-badge">本地</span>
+      </div>
+      <p class="muted header-desc">
+        配置游戏路径后，将扫描游戏目录下的 <code>mods</code> 文件夹并列出符合格式的 mod。
+      </p>
     </header>
 
     <section class="card">
@@ -385,21 +549,19 @@ onMounted(refreshState)
           </thead>
           <tbody>
             <tr
-              v-for="item in rowsWithFolderSpan"
-              :key="rowKey(item.mod)"
+              v-for="item in collapsedTableRows"
+              :key="collapsedRowKey(item)"
               :class="{ dim: item.mod.disabled }"
             >
-              <td
-                v-if="item.folderFirst"
-                class="folder-cell cell-wrap"
-                :rowspan="item.folderSpan"
-              >
-                <div class="folder-name mono">{{ item.mod.folderName }}</div>
+              <td class="folder-cell cell-wrap">
+                <div class="folder-name mono">
+                  {{ displayFolderLabel(item.mod) }}
+                </div>
                 <div class="folder-actions">
-                  <button type="button" @click.stop="onOpenModFolder(item.mod.folderName)">
+                  <button type="button" @click.stop="onOpenModFolder(openFolderTargetPath(item.mod))">
                     打开文件夹
                   </button>
-                  <button type="button" @click.stop="onExportModFolderZip(item.mod.folderName)">
+                  <button type="button" @click.stop="onExportModFolderZip(openFolderTargetPath(item.mod))">
                     导出 Zip…
                   </button>
                 </div>
@@ -409,7 +571,23 @@ onMounted(refreshState)
               </td>
               <td class="cell-wrap">{{ item.mod.manifest.name }}</td>
               <td class="cell-wrap">{{ item.mod.manifest.author }}</td>
-              <td class="cell-wrap">{{ item.mod.manifest.version }}</td>
+              <td v-if="item.normalizedGroup" class="cell-wrap ver-td">
+                <select
+                  class="ver-select"
+                  :value="selectedVersionKeyForGroup(item.mod)"
+                  :disabled="saving"
+                  @change="onVersionSelectFromGroup($event, item.mod)"
+                >
+                  <option
+                    v-for="opt in versionOptionsForGroup(item.mod)"
+                    :key="opt.k"
+                    :value="opt.k"
+                  >
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </td>
+              <td v-else class="cell-wrap">{{ item.mod.manifest.version }}</td>
               <td class="desc-cell col-desc">
                 <div class="desc-row">
                   <div
@@ -471,17 +649,11 @@ onMounted(refreshState)
       <h2>导入 Mod</h2>
       <p class="muted">
         支持 .zip / .rar。ZIP 会按 UTF-8 标记自动识别中文文件名；国内常见 GBK 编码的 zip 也会尝试修正。.rar 若中文乱码可改用 zip。
-        若根目录只有一个文件夹，将把该文件夹<strong>内容</strong>放进目标目录；自定义文件夹名将始终作为 mods 下的文件夹名；散落文件则装入以压缩包名或自定义名命名的文件夹。
+        导入位置由 manifest 的 <strong>id</strong> 决定：若该 id 已存在则并入其目录下新版本子文件夹；否则在 mods 下新建以 id 命名的目录。根目录可直接放 manifest、dll、pck 等文件；若只有<strong>一个顶层文件夹</strong>，会在其下<strong>递归查找</strong>第一个含有 manifest 的子目录作为 mod 根（支持多一层或数层嵌套）。若根下有多于一个<strong>并列子文件夹</strong>，则每个顶层文件夹内各找一份 mod 分别导入。
       </p>
       <div class="row">
         <input v-model="importPath" class="grow" type="text" placeholder="压缩包路径" readonly />
         <button type="button" @click="onBrowseImport">选择压缩包…</button>
-      </div>
-      <div class="row">
-        <label class="grow">
-          自定义文件夹名（可选，任意情况均可填写；留空则按压缩包结构自动命名）
-          <input v-model="importFolderName" type="text" placeholder="例如 MyMod；留空则自动" />
-        </label>
       </div>
       <div class="row">
         <button type="button" class="primary" :disabled="saving" @click="doImport">导入到 mods</button>
@@ -494,11 +666,15 @@ onMounted(refreshState)
         <h3>Mod 详情</h3>
         <dl class="detail-dl">
           <dt>文件夹名</dt>
-          <dd class="mono">{{ detail.folderName }}</dd>
+          <dd class="mono">{{ displayFolderLabel(detail) }}（{{ detail.folderName }}）</dd>
           <dt>Manifest 文件名</dt>
           <dd class="mono">{{ detail.manifestFile }}</dd>
           <dt>状态</dt>
           <dd>{{ detail.disabled ? '已关闭（json/pck/dll 已加 .bak）' : '运行中' }}</dd>
+          <template v-if="detail.layoutNormalized && detail.alternateVersions?.length">
+            <dt>其它版本</dt>
+            <dd class="muted small-hint">在列表「version」列的下拉框中切换启用版本。</dd>
+          </template>
         </dl>
         <p class="detail-hint">以下为 manifest JSON 中的全部字段：</p>
         <pre class="json-block">{{ manifestJSON(detail) }}</pre>
@@ -525,7 +701,7 @@ onMounted(refreshState)
             v-model="editing.newFolderName"
             class="field-input"
             type="text"
-            placeholder="mods 目录下的文件夹名称"
+            placeholder="mods 下最外层目录名（两段式布局时不含版本子文件夹）"
           />
         </div>
         <div class="field-row field-row-top">
@@ -540,11 +716,37 @@ onMounted(refreshState)
           </label>
         </div>
         <div class="row between">
-          <button type="button" class="danger" :disabled="saving" @click="deleteModFromEdit">删除此 Mod</button>
+          <button type="button" class="danger" :disabled="saving" @click="openDeleteConfirmFromEdit">
+            删除此 Mod
+          </button>
           <div class="row end tight">
             <button type="button" @click="closeEdit">取消</button>
             <button type="button" class="primary" :disabled="saving" @click="submitEdit">保存</button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="deleteConfirm" class="overlay overlay-front" @click.self="closeDeleteConfirm">
+      <div class="dialog dialog-delete" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title">
+        <h3 id="delete-dialog-title">删除 Mod</h3>
+        <p class="delete-mod-name">{{ deleteConfirm.modName }}</p>
+        <p class="muted delete-intro">请选择要删除的范围（此操作不可撤销）：</p>
+        <ul class="delete-options">
+          <li>
+            <strong>仅删除当前版本</strong>：移除当前 manifest 所在的<strong>整个版本目录</strong>（含 json、pck、dll 等）；同一 mod
+            的其它版本会保留。
+          </li>
+          <li>
+            <strong>删除全部版本</strong>：删除该 mod 在磁盘上的<strong>整个顶层目录</strong>（slug 下所有已安装版本一并移除）。
+          </li>
+        </ul>
+        <div class="delete-actions">
+          <button type="button" :disabled="saving" @click="closeDeleteConfirm">取消</button>
+          <button type="button" class="danger-muted" :disabled="saving" @click="runDelete(false)">
+            仅删除当前版本
+          </button>
+          <button type="button" class="danger" :disabled="saving" @click="runDelete(true)">删除全部版本</button>
         </div>
       </div>
     </div>
@@ -553,30 +755,109 @@ onMounted(refreshState)
 
 <style scoped>
 .layout {
+  --surface: rgba(30, 41, 59, 0.55);
+  --surface-border: rgba(148, 163, 184, 0.14);
+  --surface-hover: rgba(51, 65, 85, 0.45);
+  --ring: rgba(56, 189, 248, 0.55);
+  --primary: #38bdf8;
+  --primary-deep: #0284c7;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 22px 50px rgba(0, 0, 0, 0.45);
   max-width: min(1580px, 98vw);
   margin: 0 auto;
-  padding: 26px 32px 60px;
+  padding: 28px 28px 72px;
   text-align: left;
 }
+
+.header {
+  margin-bottom: 28px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--surface-border);
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
 .header h1 {
-  margin: 0 0 8px;
-  font-size: 1.35rem;
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  background: linear-gradient(120deg, #f8fafc 0%, #bae6fd 45%, #7dd3fc 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
+
+.header-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  background: rgba(56, 189, 248, 0.12);
+  color: #7dd3fc;
+}
+
+.header-desc {
+  margin: 0;
+  max-width: 52rem;
+  line-height: 1.55;
+}
+
 .muted {
-  color: rgba(255, 255, 255, 0.65);
-  font-size: 0.9rem;
+  color: rgba(226, 232, 240, 0.72);
+  font-size: 0.92rem;
   margin: 0 0 12px;
 }
+
 .card {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
-  padding: 16px 18px;
-  margin-bottom: 16px;
+  position: relative;
+  background: var(--surface);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  padding: 20px 22px;
+  margin-bottom: 18px;
+  box-shadow: var(--shadow-sm);
+  transition:
+    border-color 0.25s ease,
+    box-shadow 0.25s ease,
+    background 0.25s ease;
 }
+
+.card:hover {
+  border-color: rgba(148, 163, 184, 0.22);
+  box-shadow: var(--shadow-md);
+}
+
 .card h2 {
-  margin: 0 0 12px;
-  font-size: 1.05rem;
+  margin: 0 0 16px;
+  font-size: 1.08rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: #f1f5f9;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card h2::before {
+  content: '';
+  width: 4px;
+  height: 1.1em;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #38bdf8, #6366f1);
+  flex-shrink: 0;
 }
 .row {
   display: flex;
@@ -611,35 +892,96 @@ onMounted(refreshState)
 label.grow {
   display: block;
 }
+
 button {
-  padding: 8px 12px;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  background: rgba(255, 255, 255, 0.06);
-  color: inherit;
+  position: relative;
+  padding: 9px 16px;
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(255, 255, 255, 0.07);
+  color: #f1f5f9;
   cursor: pointer;
   white-space: nowrap;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  user-select: none;
+  transition:
+    transform 0.14s cubic-bezier(0.33, 1, 0.68, 1),
+    box-shadow 0.2s ease,
+    background 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease,
+    opacity 0.2s ease;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset;
 }
+
+button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: rgba(186, 230, 253, 0.28);
+  transform: translateY(-1px);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 6px 16px rgba(0, 0, 0, 0.28);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(0) scale(0.97);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.2) inset;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
 button.primary {
-  background: #3b82f6;
-  border-color: #3b82f6;
+  border-color: transparent;
+  background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%);
+  color: #fff;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.2) inset,
+    0 4px 14px rgba(14, 165, 233, 0.35);
 }
+
+button.primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #38bdf8 0%, #3b82f6 100%);
+  border-color: transparent;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.25) inset,
+    0 8px 22px rgba(56, 189, 248, 0.4);
+}
+
+button.primary:active:not(:disabled) {
+  background: linear-gradient(135deg, #0284c7 0%, #1d4ed8 100%);
+}
+
 button.danger {
   border-color: rgba(248, 113, 113, 0.45);
   color: #fecaca;
+  background: rgba(239, 68, 68, 0.1);
 }
+
+button.danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: rgba(252, 165, 165, 0.55);
+  color: #fff;
+}
+
 button:disabled {
-  opacity: 0.55;
+  opacity: 0.5;
   cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
 }
 .meta-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 10px 14px;
-  margin-top: 8px;
-  font-size: 0.85rem;
-  color: rgba(255, 255, 255, 0.75);
+  margin-top: 10px;
+  font-size: 0.86rem;
+  color: rgba(226, 232, 240, 0.78);
 }
 .meta-path {
   flex: 1;
@@ -651,6 +993,10 @@ button:disabled {
 }
 .table-wrap {
   overflow-x: auto;
+  margin: 4px -4px 0;
+  padding: 4px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.15);
 }
 .grid {
   width: 100%;
@@ -662,20 +1008,76 @@ button:disabled {
   vertical-align: top;
 }
 .folder-name {
-  margin-bottom: 8px;
-  line-height: 1.35;
+  margin-bottom: 10px;
+  line-height: 1.4;
   word-break: break-word;
+}
+.tag-norm {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border-radius: 4px;
+  background: rgba(80, 200, 120, 0.2);
+  color: rgba(180, 255, 200, 0.95);
+  vertical-align: middle;
+}
+.alt-versions {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+.alt-ver-li {
+  margin-bottom: 8px;
+  list-style: disc;
+}
+.small-hint {
+  margin: 8px 0 0;
+  font-size: 0.82rem;
 }
 .folder-actions {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 6px;
+  gap: 8px;
 }
 .folder-actions button {
   width: 100%;
-  padding: 6px 8px;
-  font-size: 0.85rem;
+  padding: 7px 10px;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.ver-select {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.65);
+  color: inherit;
+  font-size: 0.86rem;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease,
+    background 0.2s ease;
+}
+.ver-select:hover:not(:disabled) {
+  border-color: rgba(56, 189, 248, 0.35);
+}
+.ver-select:focus {
+  outline: none;
+  border-color: rgba(56, 189, 248, 0.55);
+  box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
+}
+.ver-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.ver-td {
+  vertical-align: top;
 }
 .cw-folder {
   width: 14%;
@@ -690,7 +1092,7 @@ button:disabled {
   width: 11%;
 }
 .cw-ver {
-  width: 6%;
+  width: 10%;
 }
 /* description 列相对更早版本约缩短 1/4 */
 .cw-desc {
@@ -703,7 +1105,7 @@ button:disabled {
   width: 6%;
 }
 .cw-act {
-  width: 10%;
+  width: 12%;
 }
 .cell-wrap {
   min-width: 0;
@@ -712,16 +1114,35 @@ button:disabled {
 }
 .grid th,
 .grid td {
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 8px 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  padding: 11px 12px;
   text-align: left;
   vertical-align: top;
 }
+
+.grid thead th {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: rgba(148, 163, 184, 0.95);
+  background: rgba(15, 23, 42, 0.5);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.grid tbody tr {
+  transition: background 0.16s ease;
+}
+
+.grid tbody tr:hover td {
+  background: rgba(56, 189, 248, 0.06);
+}
+
 .grid tr.dim td {
   opacity: 0.72;
 }
 .col-actions {
-  min-width: 160px;
+  min-width: 200px;
 }
 .actions {
   white-space: nowrap;
@@ -764,22 +1185,40 @@ button:disabled {
 .btn-link {
   display: inline-block;
   margin-top: 6px;
-  padding: 0;
+  padding: 5px 10px;
+  border-radius: 6px;
   border: none;
   background: transparent;
-  color: #93c5fd;
+  color: #7dd3fc;
   font-size: 0.82rem;
+  font-weight: 600;
   cursor: pointer;
-  text-decoration: underline;
+  text-decoration: none;
+  transition:
+    background 0.18s ease,
+    color 0.18s ease,
+    transform 0.12s ease;
 }
+
 .btn-desc-inline {
   flex-shrink: 0;
   align-self: flex-end;
   margin-top: 0;
   white-space: nowrap;
 }
+
 .btn-link:hover {
-  color: #bfdbfe;
+  color: #e0f2fe;
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.btn-link:active {
+  transform: scale(0.96);
+}
+
+.btn-link:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
 .col-switch {
   vertical-align: middle;
@@ -788,9 +1227,15 @@ button:disabled {
 .switch {
   position: relative;
   display: inline-block;
-  width: 44px;
-  height: 26px;
+  width: 46px;
+  height: 28px;
+  cursor: pointer;
 }
+
+.switch:active input:not(:disabled) ~ .slider {
+  filter: brightness(0.92);
+}
+
 .switch input {
   opacity: 0;
   width: 0;
@@ -800,27 +1245,35 @@ button:disabled {
   position: absolute;
   cursor: pointer;
   inset: 0;
-  background-color: #64748b;
-  border-radius: 26px;
-  transition: background-color 0.2s;
+  background: linear-gradient(180deg, #64748b, #475569);
+  border-radius: 28px;
+  transition:
+    background 0.22s ease,
+    box-shadow 0.22s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35) inset;
 }
 .switch .slider:before {
   position: absolute;
   content: '';
-  height: 20px;
-  width: 20px;
+  height: 22px;
+  width: 22px;
   left: 3px;
   bottom: 3px;
-  background: #fff;
+  background: linear-gradient(180deg, #fff, #e2e8f0);
   border-radius: 50%;
-  transition: transform 0.2s ease;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: transform 0.22s cubic-bezier(0.33, 1, 0.68, 1);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 .switch input:checked + .slider {
-  background-color: #22c55e;
+  background: linear-gradient(180deg, #22c55e, #16a34a);
+  box-shadow: 0 0 12px rgba(34, 197, 94, 0.35);
 }
 .switch input:checked + .slider:before {
   transform: translateX(18px);
+}
+.switch input:focus-visible + .slider {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
 }
 .switch input:disabled + .slider {
   opacity: 0.55;
@@ -847,65 +1300,121 @@ button:disabled {
   height: 10px;
   border-radius: 50%;
   background: #22c55e;
-  box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.25);
+  box-shadow:
+    0 0 0 2px rgba(34, 197, 94, 0.25),
+    0 0 10px rgba(34, 197, 94, 0.35);
   vertical-align: middle;
 }
 input[type='text'],
 textarea {
   width: 100%;
-  padding: 8px 10px;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(0, 0, 0, 0.25);
-  color: inherit;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(15, 23, 42, 0.55);
+  color: #f1f5f9;
   margin-top: 6px;
   box-sizing: border-box;
+  font-size: 0.92rem;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease,
+    background 0.2s ease;
 }
+
+input[type='text']:hover,
+textarea:hover {
+  border-color: rgba(148, 163, 184, 0.32);
+}
+
+input[type='text']:read-only {
+  cursor: default;
+  opacity: 0.92;
+}
+
+input[type='text']:focus,
+textarea:focus {
+  outline: none;
+  border-color: rgba(56, 189, 248, 0.55);
+  box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
+  background: rgba(15, 23, 42, 0.75);
+}
+
 .meta {
   font-size: 0.85rem;
   color: rgba(255, 255, 255, 0.75);
 }
 code {
   font-size: 0.85em;
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.35);
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  color: #bae6fd;
 }
 .msg {
-  margin-top: 10px;
-  padding: 10px 12px;
-  border-radius: 8px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
   font-size: 0.9rem;
+  line-height: 1.45;
 }
 .msg.err {
-  background: rgba(239, 68, 68, 0.15);
-  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  color: #fecaca;
 }
 .import-err {
   margin-top: 12px;
 }
 .msg.warn {
-  background: rgba(234, 179, 8, 0.12);
-  border: 1px solid rgba(234, 179, 8, 0.35);
-  margin-bottom: 16px;
+  background: rgba(234, 179, 8, 0.1);
+  border: 1px solid rgba(250, 204, 21, 0.35);
+  margin-bottom: 18px;
+  color: #fef3c7;
 }
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
   padding: 20px;
+  animation: overlayIn 0.22s ease;
 }
+
+@keyframes overlayIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .dialog {
   width: min(520px, 100%);
-  background: #1e293b;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 12px;
-  padding: 18px 20px;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+  background: linear-gradient(165deg, rgba(30, 41, 59, 0.98) 0%, rgba(15, 23, 42, 0.99) 100%);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 16px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow-lg);
+  animation: dialogIn 0.28s cubic-bezier(0.33, 1, 0.68, 1);
+}
+
+@keyframes dialogIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
 }
 .dialog-wide {
   width: min(640px, 100%);
@@ -913,7 +1422,11 @@ code {
   overflow: auto;
 }
 .dialog h3 {
-  margin: 0 0 14px;
+  margin: 0 0 16px;
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #f8fafc;
 }
 .field-row {
   display: flex;
@@ -964,13 +1477,64 @@ code {
 }
 .json-block {
   margin: 0;
-  padding: 12px 14px;
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.35);
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: rgba(2, 6, 23, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.12);
   font-size: 0.78rem;
   line-height: 1.45;
   overflow-x: auto;
   white-space: pre;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.overlay-front {
+  z-index: 60;
+}
+.dialog-delete {
+  width: min(500px, 100%);
+}
+.dialog-delete h3 {
+  margin-bottom: 10px;
+}
+.delete-mod-name {
+  margin: 0 0 6px;
+  font-size: 1.02rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.95);
+}
+.delete-intro {
+  margin: 0 0 12px;
+}
+.delete-options {
+  margin: 0 0 18px;
+  padding-left: 1.15rem;
+  line-height: 1.55;
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.88);
+}
+.delete-options li + li {
+  margin-top: 8px;
+}
+.delete-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+  align-items: center;
+  margin-top: 4px;
+}
+button.danger-muted {
+  border-color: rgba(248, 113, 113, 0.4);
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.1);
+}
+
+button.danger-muted:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.2);
+  border-color: rgba(252, 165, 165, 0.55);
+}
+
+button.danger-muted:active:not(:disabled) {
+  transform: scale(0.97);
 }
 </style>

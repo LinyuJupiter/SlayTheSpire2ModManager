@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,6 +71,61 @@ func mergeCanonicalJSONKeys(keys map[string]json.RawMessage) {
 	}
 }
 
+// 非 mod manifest 的 JSON 文件名（小写），扫描时跳过。
+var ignoredNonModJSONBaseNames = map[string]struct{}{
+	"package": {}, "tsconfig": {}, "jsconfig": {}, "manifest": {},
+	"settings": {}, "launch": {}, "tasks": {}, "extensions": {},
+	"package-lock": {}, "composer": {}, "cargo": {}, "pyproject": {},
+	"poetry": {}, "pipfile": {}, "renovate": {}, "dependabot": {},
+	"azure-pipelines": {}, "bitbucket-pipelines": {}, "travis": {},
+	"appveyor": {}, "circleci": {}, "gitlab-ci": {}, "jenkins": {},
+	"firebase": {}, "angular": {}, "nx": {}, "lerna": {},
+	"bower": {}, "yarn": {}, "pnpm-workspace": {}, "rush": {},
+	"webpack": {}, "rollup": {}, "vite": {}, "esbuild": {},
+	"babel": {}, "eslint": {}, "prettier": {}, "stylelint": {},
+	"jest": {}, "vitest": {}, "cypress": {}, "playwright": {},
+	"sonar-project": {}, "codecov": {}, "coveralls": {},
+	"swagger": {}, "openapi": {}, "redocly": {}, "spectral": {},
+	"graphql-codegen": {}, "graphql.config": {}, "apollo": {},
+	"terraform": {}, "pulumi": {}, "serverless": {}, "sam": {},
+	"cloudformation": {}, "cdk": {}, "helm": {}, "kustomization": {},
+	"skaffold": {}, "tilt": {}, "docker-compose": {}, "compose": {},
+	"lefthook": {}, "husky": {},
+	"lint-staged": {}, "commitlint": {}, "semantic-release": {},
+	"release-please": {}, "changesets": {}, "beachball": {},
+	"turbo": {}, "moon": {},
+}
+
+func isIgnoredNonModJSONBaseName(base string) bool {
+	base = strings.TrimSuffix(strings.TrimSuffix(strings.ToLower(base), ".json.bak"), ".json")
+	_, ok := ignoredNonModJSONBaseNames[base]
+	return ok
+}
+
+// quickProbablyModManifest 对 manifest 做轻量启发式，避免对明显非 mod 的 JSON 做完整解析。
+func quickProbablyModManifest(data []byte) bool {
+	data = normalizeManifestEncoding(data)
+	if len(data) == 0 {
+		return false
+	}
+	if data[0] != '{' {
+		return false
+	}
+	if !bytes.Contains(data, []byte(`"id"`)) && !bytes.Contains(data, []byte(`"Id"`)) && !bytes.Contains(data, []byte(`"ID"`)) {
+		return false
+	}
+	if !bytes.Contains(data, []byte(`"has_pck"`)) && !bytes.Contains(data, []byte(`"hasPck"`)) {
+		return false
+	}
+	if !bytes.Contains(data, []byte(`"has_dll"`)) && !bytes.Contains(data, []byte(`"hasDll"`)) {
+		return false
+	}
+	if !bytes.Contains(data, []byte(`"affects_gameplay"`)) && !bytes.Contains(data, []byte(`"affectsGameplay"`)) {
+		return false
+	}
+	return true
+}
+
 func tryParseModManifest(data []byte) (ModManifest, bool) {
 	data = normalizeManifestEncoding(data)
 	var keys map[string]json.RawMessage
@@ -83,16 +139,25 @@ func tryParseModManifest(data []byte) (ModManifest, bool) {
 			return ModManifest{}, false
 		}
 	}
-	normalized, err := json.Marshal(keys)
-	if err != nil {
-		return ModManifest{}, false
-	}
 	var m ModManifest
-	if err := json.Unmarshal(normalized, &m); err != nil {
+	if err := json.Unmarshal(keys["id"], &m.ID); err != nil || strings.TrimSpace(m.ID) == "" {
 		return ModManifest{}, false
 	}
-	if strings.TrimSpace(m.ID) == "" {
+	if err := json.Unmarshal(keys["has_pck"], &m.HasPck); err != nil {
 		return ModManifest{}, false
+	}
+	if err := json.Unmarshal(keys["has_dll"], &m.HasDll); err != nil {
+		return ModManifest{}, false
+	}
+	if err := json.Unmarshal(keys["affects_gameplay"], &m.AffectsGameplay); err != nil {
+		return ModManifest{}, false
+	}
+	_ = json.Unmarshal(keys["name"], &m.Name)
+	_ = json.Unmarshal(keys["author"], &m.Author)
+	_ = json.Unmarshal(keys["description"], &m.Description)
+	_ = json.Unmarshal(keys["version"], &m.Version)
+	if raw, ok := keys["dependencies"]; ok {
+		_ = json.Unmarshal(raw, &m.Dependencies)
 	}
 	return m, true
 }
@@ -103,32 +168,86 @@ type manifestDiscovered struct {
 	Disabled bool
 }
 
-func findAllManifestsInFolder(dir string) ([]manifestDiscovered, error) {
-	entries, err := os.ReadDir(dir)
+// 防止误把巨型 JSON 当 manifest 一次性读入内存；正常 manifest 很小。
+const maxModManifestReadBytes = 256 * 1024
+
+func readModManifestBytes(path string) ([]byte, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	var enabledNames, bakNames []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	defer f.Close()
+	lim := io.LimitReader(f, maxModManifestReadBytes+1)
+	b, err := io.ReadAll(lim)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxModManifestReadBytes {
+		return nil, errors.New("manifest 文件过大")
+	}
+	return b, nil
+}
+
+// listManifestJSONBaseNames 仅枚举目录下 manifest 候选文件名，使用分批 Readdirnames，避免 os.ReadDir
+// 在「单目录海量文件」时一次性分配巨大内存。
+func listManifestJSONBaseNames(dir string) (enabledNames, bakNames []string, err error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	const chunk = 4096
+	for {
+		names, rdErr := f.Readdirnames(chunk)
+		for _, name := range names {
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			if isIgnoredNonModJSONBaseName(name) {
+				continue
+			}
+			lower := strings.ToLower(name)
+			if strings.HasSuffix(lower, ".json.bak") {
+				bakNames = append(bakNames, name)
+			} else if strings.HasSuffix(lower, ".json") {
+				enabledNames = append(enabledNames, name)
+			}
 		}
-		name := e.Name()
-		lower := strings.ToLower(name)
-		if strings.HasSuffix(lower, ".json") && !strings.HasSuffix(lower, ".json.bak") {
-			enabledNames = append(enabledNames, name)
+		if rdErr != nil {
+			if rdErr != io.EOF {
+				return nil, nil, rdErr
+			}
+			break
 		}
-		if strings.HasSuffix(lower, ".json.bak") {
-			bakNames = append(bakNames, name)
+		if len(names) < chunk {
+			break
 		}
 	}
 	sort.Strings(enabledNames)
 	sort.Strings(bakNames)
+	const maxJSONNamesPerSide = 96
+	if len(enabledNames) > maxJSONNamesPerSide {
+		enabledNames = enabledNames[:maxJSONNamesPerSide]
+	}
+	if len(bakNames) > maxJSONNamesPerSide {
+		bakNames = bakNames[:maxJSONNamesPerSide]
+	}
+	return enabledNames, bakNames, nil
+}
+
+func findAllManifestsInFolder(dir string) ([]manifestDiscovered, error) {
+	enabledNames, bakNames, err := listManifestJSONBaseNames(dir)
+	if err != nil {
+		return nil, err
+	}
 	var out []manifestDiscovered
 	for _, name := range enabledNames {
 		p := filepath.Join(dir, name)
-		b, err := os.ReadFile(p)
+		b, err := readModManifestBytes(p)
 		if err != nil {
+			continue
+		}
+		if !quickProbablyModManifest(b) {
 			continue
 		}
 		if m, ok := tryParseModManifest(b); ok {
@@ -137,8 +256,11 @@ func findAllManifestsInFolder(dir string) ([]manifestDiscovered, error) {
 	}
 	for _, name := range bakNames {
 		p := filepath.Join(dir, name)
-		b, err := os.ReadFile(p)
+		b, err := readModManifestBytes(p)
 		if err != nil {
+			continue
+		}
+		if !quickProbablyModManifest(b) {
 			continue
 		}
 		if m, ok := tryParseModManifest(b); ok {
@@ -152,9 +274,12 @@ func findAllManifestsInFolder(dir string) ([]manifestDiscovered, error) {
 }
 
 func loadManifestFromPath(fullPath string) (ModManifest, error) {
-	b, err := os.ReadFile(fullPath)
+	b, err := readModManifestBytes(fullPath)
 	if err != nil {
 		return ModManifest{}, err
+	}
+	if !quickProbablyModManifest(b) {
+		return ModManifest{}, errors.New("JSON 不是有效的 mod 描述")
 	}
 	m, ok := tryParseModManifest(b)
 	if !ok {

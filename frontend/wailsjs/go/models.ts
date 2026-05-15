@@ -21,6 +21,22 @@ export namespace app {
 
 export namespace mods {
 	
+	export class ModVersionRef {
+	    folderName: string;
+	    manifestFile: string;
+	    disabled: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModVersionRef(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.folderName = source["folderName"];
+	        this.manifestFile = source["manifestFile"];
+	        this.disabled = source["disabled"];
+	    }
+	}
 	export class ModManifest {
 	    id: string;
 	    name: string;
@@ -58,6 +74,8 @@ export namespace mods {
 	    conflictWith: string[];
 	    missingDependencies: string[];
 	    available: boolean;
+	    layoutNormalized: boolean;
+	    alternateVersions: ModVersionRef[];
 	
 	    static createFrom(source: any = {}) {
 	        return new InstalledMod(source);
@@ -73,6 +91,8 @@ export namespace mods {
 	        this.conflictWith = source["conflictWith"];
 	        this.missingDependencies = source["missingDependencies"];
 	        this.available = source["available"];
+	        this.layoutNormalized = source["layoutNormalized"];
+	        this.alternateVersions = this.convertValues(source["alternateVersions"], ModVersionRef);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -96,6 +116,7 @@ export namespace mods {
 	export class ModEditPayload {
 	    folderName: string;
 	    newFolderName: string;
+	    layoutNormalized: boolean;
 	    manifestFile: string;
 	    id: string;
 	    name: string;
@@ -110,6 +131,7 @@ export namespace mods {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.folderName = source["folderName"];
 	        this.newFolderName = source["newFolderName"];
+	        this.layoutNormalized = source["layoutNormalized"];
 	        this.manifestFile = source["manifestFile"];
 	        this.id = source["id"];
 	        this.name = source["name"];
@@ -117,6 +139,7 @@ export namespace mods {
 	        this.affects_gameplay = source["affects_gameplay"];
 	    }
 	}
+	
 	
 	export class ModsOverview {
 	    modsDir: string;
@@ -151,6 +174,22 @@ export namespace mods {
 		    }
 		    return a;
 		}
+	}
+	export class NormalizeReport {
+	    migrated: string[];
+	    skipped: string[];
+	    errors: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new NormalizeReport(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.migrated = source["migrated"];
+	        this.skipped = source["skipped"];
+	        this.errors = source["errors"];
+	    }
 	}
 
 }

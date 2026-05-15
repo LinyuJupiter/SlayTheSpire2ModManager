@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"ModManager/internal/modexport"
 )
 
 func normalizeFolderKey(s string) string {
@@ -35,17 +33,34 @@ func validateRelFolderPath(name string) error {
 	return nil
 }
 
+func splitFolderForEdit(folderName string, layoutNormalized bool) (outer, inner string) {
+	fn := strings.Trim(strings.TrimSpace(folderName), `/\`)
+	fn = filepath.ToSlash(filepath.Clean(filepath.FromSlash(fn)))
+	if fn == "." || fn == "" {
+		return "", ""
+	}
+	if layoutNormalized && isNormTwoSegmentLayout(fn) {
+		segs := strings.Split(fn, "/")
+		return segs[0], segs[1]
+	}
+	return fn, ""
+}
+
+func joinFolderForEdit(outer, inner string) string {
+	outer = strings.Trim(strings.TrimSpace(outer), `/\`)
+	inner = strings.Trim(strings.TrimSpace(inner), `/\`)
+	if outer == "" {
+		return inner
+	}
+	if inner == "" {
+		return outer
+	}
+	return outer + "/" + inner
+}
+
 // SaveEdits 保存对 manifest 与文件夹名的修改。
 func SaveEdits(modsRoot string, payload ModEditPayload) error {
-	newFolder := strings.TrimSpace(payload.NewFolderName)
-	if newFolder == "" {
-		newFolder = payload.FolderName
-	}
-	if err := validateRelFolderPath(newFolder); err != nil {
-		return err
-	}
-
-	oldFolderPath, err := modexport.ResolvedSubfolder(modsRoot, payload.FolderName)
+	oldFolderPath, err := ResolveSubfolder(modsRoot, payload.FolderName)
 	if err != nil {
 		return err
 	}
@@ -82,19 +97,52 @@ func SaveEdits(modsRoot string, payload ModEditPayload) error {
 		return err
 	}
 
+	outerOld, innerOld := splitFolderForEdit(payload.FolderName, payload.LayoutNormalized)
+	newFolder := strings.TrimSpace(payload.NewFolderName)
+	if newFolder == "" {
+		newFolder = joinFolderForEdit(outerOld, innerOld)
+	}
+	if err := validateRelFolderPath(newFolder); err != nil {
+		return err
+	}
+	newOuter, newInner := splitFolderForEdit(newFolder, payload.LayoutNormalized)
+	if innerOld != "" && newInner != "" && newInner != innerOld {
+		return errors.New("不允许单独修改版本子目录名，请只改最外层文件夹名")
+	}
+	if innerOld != "" {
+		newFolder = joinFolderForEdit(newOuter, innerOld)
+		if err := validateRelFolderPath(newFolder); err != nil {
+			return err
+		}
+	}
+
 	workingFolder := oldFolderPath
 	if normalizeFolderKey(newFolder) != normalizeFolderKey(payload.FolderName) {
-		destFolder, err := modexport.ResolvedSubfolder(modsRoot, newFolder)
-		if err != nil {
-			return err
+		if innerOld != "" {
+			if normalizeFolderKey(newOuter) != normalizeFolderKey(outerOld) {
+				oldSlugAbs := filepath.Join(modsRoot, filepath.FromSlash(normalizeFolderKey(outerOld)))
+				newSlugAbs := filepath.Join(modsRoot, filepath.FromSlash(normalizeFolderKey(newOuter)))
+				if _, err := os.Stat(newSlugAbs); err == nil {
+					return fmt.Errorf("目标文件夹已存在: %s", newOuter)
+				}
+				if err := os.Rename(oldSlugAbs, newSlugAbs); err != nil {
+					return fmt.Errorf("重命名 mod 目录: %w", err)
+				}
+				workingFolder = filepath.Join(newSlugAbs, filepath.FromSlash(innerOld))
+			}
+		} else {
+			destFolder, err := ResolveSubfolder(modsRoot, newFolder)
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(destFolder); err == nil {
+				return fmt.Errorf("目标文件夹已存在: %s", newFolder)
+			}
+			if err := os.Rename(oldFolderPath, destFolder); err != nil {
+				return err
+			}
+			workingFolder = destFolder
 		}
-		if _, err := os.Stat(destFolder); err == nil {
-			return errors.New("目标文件夹已存在: " + newFolder)
-		}
-		if err := os.Rename(oldFolderPath, destFolder); err != nil {
-			return err
-		}
-		workingFolder = destFolder
 	}
 
 	outJSON := filepath.Join(workingFolder, payload.ManifestFile)

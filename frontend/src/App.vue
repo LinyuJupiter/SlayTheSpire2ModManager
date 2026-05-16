@@ -15,12 +15,29 @@ import {
   OpenModFolder,
   ExportModFolderZip,
   ActivateModVersion,
+  CurrentVersion,
+  AboutMarkdown,
+  StartBackgroundUpdate,
+  GetUpdateDownloadState,
+  InstallUpdate,
 } from '../wailsjs/go/app/App'
 const gameExePath = ref('')
 const modsRoot = ref('')
 const overview = ref(null)
 const loadError = ref('')
 const actionError = ref('')
+const currentVersion = ref('')
+const updateInfo = ref(null)
+const updateStatus = ref('')
+const updateError = ref('')
+const checkingUpdate = ref(false)
+const installingUpdate = ref(false)
+const updateDownloadState = ref(null)
+const updateReadyPromptShown = ref(false)
+const settingsOpen = ref(false)
+const aboutOpen = ref(false)
+const aboutMarkdown = ref('')
+const updatePromptOpen = ref(false)
 /** 仅导入 Mod 相关错误，显示在「导入 Mod」卡片内 */
 const importError = ref('')
 const saving = ref(false)
@@ -36,6 +53,11 @@ const duplicateBanner = computed(() => {
   if (!overview.value?.duplicateIDs?.length) return ''
   return `以下 mod id 重复出现：${overview.value.duplicateIDs.join('、')}（请手动调整相关 JSON 中的 id）`
 })
+
+const renderedAboutHtml = computed(() => renderMarkdown(aboutMarkdown.value))
+
+const updateReady = computed(() => !!updateDownloadState.value?.ready)
+const updateDownloading = computed(() => !!updateDownloadState.value?.downloading)
 
 /** 已规范布局：按 slug（第一段路径）聚合；否则仍按完整 folderName 聚合 */
 function folderGroupKey(m) {
@@ -96,6 +118,64 @@ function compareModVersionStrings(a, b) {
   if (a < b) return -1
   if (a > b) return 1
   return 0
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function renderInlineMarkdown(s) {
+  return escapeHtml(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
+}
+
+function renderMarkdown(markdown) {
+  const lines = String(markdown || '').replace(/\r\n/g, '\n').split('\n')
+  const out = []
+  let listOpen = false
+
+  function closeList() {
+    if (listOpen) {
+      out.push('</ul>')
+      listOpen = false
+    }
+  }
+
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line) {
+      closeList()
+      continue
+    }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line)
+    if (heading) {
+      closeList()
+      const level = heading[1].length
+      out.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`)
+      continue
+    }
+    const li = /^[-*]\s+(.+)$/.exec(line)
+    if (li) {
+      if (!listOpen) {
+        out.push('<ul>')
+        listOpen = true
+      }
+      out.push(`<li>${renderInlineMarkdown(li[1])}</li>`)
+      continue
+    }
+    closeList()
+    out.push(`<p>${renderInlineMarkdown(line)}</p>`)
+  }
+  closeList()
+  return out.join('')
 }
 
 function pickRepresentativeMod(group) {
@@ -288,6 +368,122 @@ async function refreshMods() {
   }
 }
 
+async function loadCurrentVersion() {
+  try {
+    currentVersion.value = await CurrentVersion()
+  } catch {
+    currentVersion.value = ''
+  }
+}
+
+let updatePollTimer = null
+
+function stopUpdatePolling() {
+  if (updatePollTimer) {
+    clearInterval(updatePollTimer)
+    updatePollTimer = null
+  }
+}
+
+function applyUpdateDownloadState(st, { showNoUpdate = false } = {}) {
+  updateDownloadState.value = st
+  checkingUpdate.value = !!st?.checking
+  if (st?.info) {
+    updateInfo.value = st.info
+  }
+  if (st?.error) {
+    updateError.value = st.error
+    return
+  }
+  if (st?.downloading) {
+    updateStatus.value = `发现新版本 v${st.info?.latestVersion}，正在后台下载更新包…`
+    return
+  }
+  if (st?.ready) {
+    updateStatus.value = `更新包 v${st.info?.latestVersion} 已下载完成`
+    if (!updateReadyPromptShown.value) {
+      updateReadyPromptShown.value = true
+      updatePromptOpen.value = true
+    }
+    return
+  }
+  if (st?.hasUpdate) {
+    updateStatus.value = `发现新版本 v${st.info?.latestVersion}`
+    return
+  }
+  if (showNoUpdate) {
+    updateStatus.value = '当前已是最新版本'
+  }
+}
+
+async function pollUpdateDownloadState() {
+  try {
+    const st = await GetUpdateDownloadState()
+    applyUpdateDownloadState(st)
+    if (!st.checking && !st.downloading) {
+      stopUpdatePolling()
+    }
+  } catch (e) {
+    updateError.value = String(e)
+    stopUpdatePolling()
+  }
+}
+
+function startUpdatePolling() {
+  if (updatePollTimer) return
+  updatePollTimer = setInterval(pollUpdateDownloadState, 2000)
+}
+
+async function startBackgroundUpdate({ manual = false } = {}) {
+  if (manual) {
+    updateError.value = ''
+    updateStatus.value = ''
+  }
+  try {
+    const st = await StartBackgroundUpdate()
+    applyUpdateDownloadState(st, { showNoUpdate: manual })
+    if (st.checking || st.downloading) {
+      startUpdatePolling()
+    }
+  } catch (e) {
+    updateError.value = String(e)
+  }
+}
+
+async function installUpdate() {
+  updateError.value = ''
+  installingUpdate.value = true
+  updateStatus.value = '正在安装更新，完成后会自动重启…'
+  try {
+    await InstallUpdate()
+  } catch (e) {
+    updateError.value = String(e)
+    installingUpdate.value = false
+  }
+}
+
+function openSettings() {
+  settingsOpen.value = true
+}
+
+function closeSettings() {
+  settingsOpen.value = false
+}
+
+async function openAbout() {
+  updateError.value = ''
+  try {
+    aboutMarkdown.value = await AboutMarkdown()
+    aboutOpen.value = true
+  } catch (e) {
+    updateError.value = String(e)
+  }
+}
+
+function closeAbout() {
+  aboutOpen.value = false
+}
+
 async function onDetectSteam() {
   actionError.value = ''
   try {
@@ -477,15 +673,24 @@ async function doImport() {
   }
 }
 
-onMounted(refreshState)
+onMounted(async () => {
+  await loadCurrentVersion()
+  await refreshState()
+  startBackgroundUpdate()
+})
 </script>
 
 <template>
   <div class="layout">
     <header class="header">
-      <div class="header-brand">
-        <h1>杀戮尖塔 2 Mod 管理器</h1>
-        <span class="header-badge">本地</span>
+      <div class="header-top">
+        <div class="header-brand">
+          <h1>杀戮尖塔 2 Mod 管理器</h1>
+          <span class="header-badge">v{{ currentVersion || 'dev' }}</span>
+        </div>
+        <button type="button" class="settings-btn" title="设置" aria-label="设置" @click="openSettings">
+          ⚙
+        </button>
       </div>
       <p class="muted header-desc">
         配置游戏路径后，将扫描游戏目录下的 <code>mods</code> 文件夹并列出符合格式的 mod。
@@ -661,6 +866,71 @@ onMounted(refreshState)
       <div v-if="importError" class="msg err import-err">{{ importError }}</div>
     </section>
 
+    <div v-if="settingsOpen" class="overlay" @click.self="closeSettings">
+      <div class="dialog dialog-settings">
+        <h3>设置</h3>
+        <div class="settings-list">
+          <button
+            type="button"
+            :disabled="checkingUpdate || updateDownloading || installingUpdate"
+            @click="startBackgroundUpdate({ manual: true })"
+          >
+            {{ checkingUpdate ? '检查中…' : updateDownloading ? '下载中…' : '检查更新' }}
+          </button>
+          <button type="button" @click="openAbout">关于</button>
+        </div>
+        <div v-if="updateStatus" class="msg ok">{{ updateStatus }}</div>
+        <div v-if="updateError" class="msg err">{{ updateError }}</div>
+        <div v-if="updateInfo?.hasUpdate" class="update-box">
+          <p class="muted small">
+            当前版本 v{{ updateInfo.currentVersion }}，最新版本 v{{ updateInfo.latestVersion }}。
+          </p>
+          <div class="row end tight">
+            <button type="button" class="primary" :disabled="!updateReady || installingUpdate" @click="installUpdate">
+              {{
+                installingUpdate
+                  ? '安装中…'
+                  : updateReady
+                    ? '安装并重启'
+                    : updateDownloading
+                      ? '后台下载中…'
+                      : '等待下载完成'
+              }}
+            </button>
+          </div>
+        </div>
+        <div class="row end">
+          <button type="button" @click="closeSettings">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="aboutOpen" class="overlay overlay-front" @click.self="closeAbout">
+      <div class="dialog dialog-wide">
+        <h3>关于</h3>
+        <div class="about-markdown" v-html="renderedAboutHtml"></div>
+        <div class="row end">
+          <button type="button" @click="closeAbout">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="updatePromptOpen" class="overlay overlay-front" @click.self="updatePromptOpen = false">
+      <div class="dialog dialog-update">
+        <h3>更新包已下载完成</h3>
+        <p class="muted">
+          当前版本 v{{ updateInfo?.currentVersion }}，最新版本 v{{ updateInfo?.latestVersion }}。是否立即安装并重启？
+        </p>
+        <div v-if="updateError" class="msg err">{{ updateError }}</div>
+        <div class="row end">
+          <button type="button" :disabled="installingUpdate" @click="updatePromptOpen = false">稍后再说</button>
+          <button type="button" class="primary" :disabled="installingUpdate" @click="installUpdate">
+            {{ installingUpdate ? '安装中…' : '安装并重启' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="detail" class="overlay" @click.self="closeDetail">
       <div class="dialog dialog-wide">
         <h3>Mod 详情</h3>
@@ -776,12 +1046,20 @@ onMounted(refreshState)
   border-bottom: 1px solid var(--surface-border);
 }
 
+.header-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
 .header-brand {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 10px;
+  min-width: 0;
 }
 
 .header h1 {
@@ -811,6 +1089,17 @@ onMounted(refreshState)
   margin: 0;
   max-width: 52rem;
   line-height: 1.55;
+}
+
+.settings-btn {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 1.1rem;
+  line-height: 1;
+  flex: 0 0 auto;
+  background: rgba(15, 23, 42, 0.55);
 }
 
 .muted {
@@ -1364,6 +1653,14 @@ code {
   border: 1px solid rgba(248, 113, 113, 0.35);
   color: #fecaca;
 }
+.msg.ok {
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.32);
+  color: #bbf7d0;
+}
+.small {
+  font-size: 0.86rem;
+}
 .import-err {
   margin-top: 12px;
 }
@@ -1420,6 +1717,12 @@ code {
   width: min(640px, 100%);
   max-height: min(90vh, 900px);
   overflow: auto;
+}
+.dialog-settings {
+  width: min(520px, 100%);
+}
+.dialog-update {
+  width: min(500px, 100%);
 }
 .dialog h3 {
   margin: 0 0 16px;
@@ -1486,6 +1789,65 @@ code {
   overflow-x: auto;
   white-space: pre;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.settings-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+.settings-list button {
+  min-height: 44px;
+  width: 100%;
+}
+.update-box {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  background: rgba(14, 165, 233, 0.08);
+}
+.about-markdown {
+  margin: 0;
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(2, 6, 23, 0.48);
+  color: rgba(241, 245, 249, 0.92);
+  word-break: break-word;
+  font-size: 0.92rem;
+  line-height: 1.65;
+}
+.about-markdown :deep(h1),
+.about-markdown :deep(h2),
+.about-markdown :deep(h3) {
+  margin: 0 0 12px;
+  color: #f8fafc;
+  line-height: 1.25;
+}
+.about-markdown :deep(h1) {
+  font-size: 1.3rem;
+}
+.about-markdown :deep(h2) {
+  font-size: 1.12rem;
+}
+.about-markdown :deep(h3) {
+  font-size: 1rem;
+}
+.about-markdown :deep(p) {
+  margin: 0 0 10px;
+}
+.about-markdown :deep(ul) {
+  margin: 0 0 12px;
+  padding-left: 1.25rem;
+}
+.about-markdown :deep(li + li) {
+  margin-top: 6px;
+}
+.about-markdown :deep(code) {
+  font-size: 0.86em;
+}
+.about-markdown :deep(a) {
+  color: #7dd3fc;
 }
 .overlay-front {
   z-index: 60;

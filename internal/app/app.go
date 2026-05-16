@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"ModManager/internal/mods"
 	"ModManager/internal/platform/config"
 	"ModManager/internal/platform/modarchive"
 	"ModManager/internal/platform/shell"
 	"ModManager/internal/platform/steam"
+	"ModManager/internal/platform/update"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -24,14 +26,23 @@ func tryAutoNormalizeMods(modsRoot string) {
 
 // App Wails 绑定入口。
 type App struct {
-	ctx       context.Context
-	cfg       config.Config
-	heyboxZip []byte
+	ctx               context.Context
+	cfg               config.Config
+	heyboxZip         []byte
+	version           string
+	aboutContent      string
+	updateMu          sync.Mutex
+	updateChecking    bool
+	updateDownloading bool
+	updateReady       bool
+	updateInfo        *update.Info
+	updatePackagePath string
+	updateErr         string
 }
 
 // New 创建 App；heyboxZip 为嵌入的 Heybox 支持包字节（可为空则跳过解压）。
-func New(heyboxZip []byte) *App {
-	return &App{heyboxZip: heyboxZip}
+func New(heyboxZip []byte, version string, aboutContent string) *App {
+	return &App{heyboxZip: heyboxZip, version: version, aboutContent: aboutContent}
 }
 
 // Startup Wails 生命周期：加载配置并初始化 mods。
@@ -56,6 +67,15 @@ type UIState struct {
 	ConfigOK    bool   `json:"configOK"`
 }
 
+type UpdateDownloadState struct {
+	Checking    bool         `json:"checking"`
+	Downloading bool         `json:"downloading"`
+	Ready       bool         `json:"ready"`
+	HasUpdate   bool         `json:"hasUpdate"`
+	Info        *update.Info `json:"info"`
+	Error       string       `json:"error"`
+}
+
 // GetUIState 返回当前保存的游戏路径与 mods 根目录。
 func (a *App) GetUIState() UIState {
 	st := UIState{
@@ -71,6 +91,111 @@ func (a *App) GetUIState() UIState {
 // DetectSteamGameExe 在 Steam 库中查找 SlayTheSpire2.exe（仅 Windows 有效）。
 func (a *App) DetectSteamGameExe() string {
 	return steam.FindSlayTheSpire2Exe()
+}
+
+func (a *App) CurrentVersion() string {
+	return a.version
+}
+
+func (a *App) AboutMarkdown() string {
+	return strings.ReplaceAll(a.aboutContent, "{version}", a.version)
+}
+
+func (a *App) CheckForUpdate() (*update.Info, error) {
+	return update.CheckLatest(context.Background(), a.version)
+}
+
+func (a *App) StartBackgroundUpdate() UpdateDownloadState {
+	a.updateMu.Lock()
+	if a.updateChecking || a.updateDownloading || a.updateReady {
+		st := a.updateStateLocked()
+		a.updateMu.Unlock()
+		return st
+	}
+	a.updateChecking = true
+	a.updateErr = ""
+	a.updateInfo = nil
+	a.updatePackagePath = ""
+	a.updateReady = false
+	st := a.updateStateLocked()
+	a.updateMu.Unlock()
+
+	go a.downloadUpdateInBackground()
+	return st
+}
+
+func (a *App) GetUpdateDownloadState() UpdateDownloadState {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+	return a.updateStateLocked()
+}
+
+func (a *App) InstallUpdate() error {
+	a.updateMu.Lock()
+	if a.updateDownloading || a.updateChecking {
+		a.updateMu.Unlock()
+		return fmt.Errorf("更新包仍在下载，请稍后")
+	}
+	pkg := a.updatePackagePath
+	a.updateMu.Unlock()
+
+	var err error
+	if pkg != "" {
+		err = update.StartHelper(pkg)
+	} else {
+		err = update.InstallLatest(context.Background(), a.version)
+	}
+	if err != nil {
+		return err
+	}
+	if a.ctx != nil {
+		runtime.Quit(a.ctx)
+	}
+	return nil
+}
+
+func (a *App) downloadUpdateInBackground() {
+	info, err := update.CheckLatest(context.Background(), a.version)
+	a.updateMu.Lock()
+	a.updateChecking = false
+	if err != nil {
+		a.updateErr = err.Error()
+		a.updateMu.Unlock()
+		return
+	}
+	a.updateInfo = info
+	if !info.HasUpdate {
+		a.updateMu.Unlock()
+		return
+	}
+	a.updateDownloading = true
+	a.updateMu.Unlock()
+
+	pkg, err := update.DownloadLatest(context.Background(), info)
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+	a.updateDownloading = false
+	if err != nil {
+		a.updateErr = err.Error()
+		return
+	}
+	a.updatePackagePath = pkg
+	a.updateReady = true
+}
+
+func (a *App) updateStateLocked() UpdateDownloadState {
+	hasUpdate := false
+	if a.updateInfo != nil {
+		hasUpdate = a.updateInfo.HasUpdate
+	}
+	return UpdateDownloadState{
+		Checking:    a.updateChecking,
+		Downloading: a.updateDownloading,
+		Ready:       a.updateReady,
+		HasUpdate:   hasUpdate,
+		Info:        a.updateInfo,
+		Error:       a.updateErr,
+	}
 }
 
 func validateExe(p string) error {

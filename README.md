@@ -38,7 +38,7 @@
 ### 1. 克隆仓库
 
 ```bash
-git clone <本仓库的 HTTPS 或 SSH 地址>
+git clone https://github.com/LinyuJupiter/SlayTheSpire2ModManager.git
 cd SlayTheSpire2ModManager
 ```
 

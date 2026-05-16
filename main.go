@@ -2,8 +2,11 @@ package main
 
 import (
 	"embed"
+	"encoding/json"
+	"os"
 
 	"ModManager/internal/app"
+	"ModManager/internal/platform/update"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -17,8 +20,33 @@ var assets embed.FS
 //go:embed assets/sts2-heybox-support.zip
 var heyboxSupportZip []byte
 
+//go:embed assets/app_version.json
+var versionJSON []byte
+
+//go:embed assets/about.md
+var aboutMarkdown string
+
+type appVersionConfig struct {
+	Version string `json:"version"`
+}
+
+func loadVersion() string {
+	var cfg appVersionConfig
+	if err := json.Unmarshal(versionJSON, &cfg); err != nil {
+		return "dev"
+	}
+	if cfg.Version == "" {
+		return "dev"
+	}
+	return cfg.Version
+}
+
 func main() {
-	application := app.New(heyboxSupportZip)
+	if update.IsHelperInvocation(os.Args[1:]) {
+		os.Exit(update.RunHelper(os.Args[1:]))
+	}
+
+	application := app.New(heyboxSupportZip, loadVersion(), aboutMarkdown)
 
 	err := wails.Run(&options.App{
 		Title:  "杀戮尖塔2 Mod 管理器",

@@ -16,6 +16,46 @@ export namespace app {
 	        this.configOK = source["configOK"];
 	    }
 	}
+	export class UpdateDownloadState {
+	    checking: boolean;
+	    downloading: boolean;
+	    ready: boolean;
+	    hasUpdate: boolean;
+	    info?: update.Info;
+	    error: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new UpdateDownloadState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.checking = source["checking"];
+	        this.downloading = source["downloading"];
+	        this.ready = source["ready"];
+	        this.hasUpdate = source["hasUpdate"];
+	        this.info = this.convertValues(source["info"], update.Info);
+	        this.error = source["error"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 
 }
 
@@ -190,6 +230,73 @@ export namespace mods {
 	        this.skipped = source["skipped"];
 	        this.errors = source["errors"];
 	    }
+	}
+
+}
+
+export namespace update {
+	
+	export class DownloadSource {
+	    name: string;
+	    downloadUrl: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DownloadSource(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.downloadUrl = source["downloadUrl"];
+	    }
+	}
+	export class Info {
+	    currentVersion: string;
+	    latestVersion: string;
+	    hasUpdate: boolean;
+	    releaseUrl: string;
+	    downloadUrl: string;
+	    assetName: string;
+	    publishedAt: string;
+	    notes: string;
+	    source: string;
+	    sources: DownloadSource[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Info(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.currentVersion = source["currentVersion"];
+	        this.latestVersion = source["latestVersion"];
+	        this.hasUpdate = source["hasUpdate"];
+	        this.releaseUrl = source["releaseUrl"];
+	        this.downloadUrl = source["downloadUrl"];
+	        this.assetName = source["assetName"];
+	        this.publishedAt = source["publishedAt"];
+	        this.notes = source["notes"];
+	        this.source = source["source"];
+	        this.sources = this.convertValues(source["sources"], DownloadSource);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }
